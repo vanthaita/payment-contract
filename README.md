@@ -1,3 +1,3 @@
 
 
-# Smartcontract in Sui network
+# Smart Contracts on the Sui Blockchain (Move language)
