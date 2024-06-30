@@ -24,7 +24,7 @@ module suipay::suipay {
         history: vector<SendReceive>
     }
 
-    public struct Request has store, drop {
+    public struct Request has store, drop, copy {
         name_requestor: vector<u8>,
         address_requestor: address,
         amount: u64,
@@ -32,7 +32,7 @@ module suipay::suipay {
         name: vector<u8>
     }
 
-    public struct SendReceive has store, drop {
+    public struct SendReceive has copy, store, drop {
         action: vector<u8>,
         amount: u64,
         message: vector<u8>,
@@ -95,14 +95,13 @@ module suipay::suipay {
             requests: vector::empty<Request>(),
             history: vector::empty<SendReceive>(),
         };
-
         vec_map::insert(&mut paypal.accounts, name, user);
         event::emit(
             EventUserAdded {
                 name: name,
                 owner: owner
             }
-        )
+        );
 
     }
 
@@ -129,7 +128,7 @@ module suipay::suipay {
 
     public entry fun pay_request(
         paypal: &mut Paypal, 
-        name: vector<u8>, 
+        name: vector<u8>,
         request_index: u64, 
         coin: &mut Coin<SUI>, 
         ctx: &mut TxContext
@@ -193,31 +192,20 @@ module suipay::suipay {
         requestor.history.push_back(receive_entry);
     }
 
+    public fun get_requests(name: vector<u8>, paypal: &mut Paypal, ctx: &mut TxContext) : vector<Request> {
+        let mut user = get_user(paypal, name);
+        let requests = user.requests;
+        requests
+    }
+    public fun get_receives(name: vector<u8>, paypal: &mut Paypal,ctx: &mut TxContext) : vector<SendReceive> {
+        let mut user = get_user(paypal, name);
+        let receives = user.history;
+        receives
+    }
+
     fun get_user(paypal: &mut Paypal, name: vector<u8>): &mut User {
         vec_map::get_mut(&mut paypal.accounts, &name)
     }
-
-
-
     
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
 }
 
