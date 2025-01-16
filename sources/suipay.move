@@ -12,7 +12,7 @@ module suipay::suipay {
     use sui::random::{Self, Random, RandomGenerator, new_generator, generate_u32};
     use std::string::{Self, String};
     use sui::url::{Self, Url};
-
+    use sui::clock::{Self, Clock};
     // Error codes
     const EUserAlreadyExists: u64 = 1;
     const EUserNotFound: u64 = 2;
@@ -23,6 +23,12 @@ module suipay::suipay {
     const EInvalidDepositAmount: u64 = 7;
     const ENotOwner: u64 = 8;
     const EInvalidUserOwner: u64 = 9;
+    const EPaymentIntentNotFound: u64 = 10;
+    const EPaymentIntentAlreadyPaid: u64 = 11;
+    const EInvalidStatus: u64 = 12;
+    const EConditionalEscrowNotFound: u64 = 13;
+    const EConditionalEscrowAlreadyFulfilled: u64 = 14;
+    const EConditionalEscrowExpired: u64 = 15;
 
     public struct Username has store {
         name: String,
@@ -38,6 +44,43 @@ module suipay::suipay {
         request_ids: vector<RequestID>,
         history: vector<SendReceive>,
         img_url: Url,
+        payment_intents: VecMap<u32, PaymentIntent>,
+        payment_intent_ids: vector<PaymentIntentID>,
+        conditional_escrows: VecMap<u32, ConditionalEscrow>,
+        conditional_escrow_ids: vector<ConditionalEscrowID>
+    }
+    
+    public struct ConditionalEscrow has store, drop, copy {
+        escrow_id: u32,
+        buyer_name: String,
+        seller_name: String,
+        amount: u64,
+        condition_price: u64, //1 SUI = x USD ( x * 10^8 )
+        status: u8, // 0: pending, 1: fulfilled, 2: canceled
+        token: String, // SUI
+        created_at: u64,
+        metadata: vector<u8>,
+        expiry: u64,
+    }
+     
+    public struct ConditionalEscrowID has store, drop, copy {
+        escrow_id: u32,
+    }
+
+
+    public struct PaymentIntent has store, drop, copy {
+        payment_intent_id: u32,
+        merchant_name: String,
+        amount: u64,
+        currency: String, // SUI
+        customer_address: address,
+        status: u8, // 0: pending, 1: paid, 2: refunded, 3: canceled
+        timestamp: u64,
+        metadata: vector<u8>,
+    }
+
+    public struct PaymentIntentID has store, drop, copy {
+        payment_intent_id: u32
     }
 
     public struct Request has store, drop, copy {
@@ -121,6 +164,47 @@ module suipay::suipay {
         name: String,
         amount: u64
     }
+    
+    public struct EventPaymentIntentCreated has copy, drop {
+        payment_intent_id: u32,
+        merchant_name: String,
+        amount: u64
+    }
+     public struct EventPaymentIntentPaid has copy, drop {
+        payment_intent_id: u32,
+        merchant_name: String,
+        amount: u64
+    }
+    
+    public struct EventPaymentIntentRefunded has copy, drop {
+       payment_intent_id: u32,
+        merchant_name: String,
+        amount: u64
+    }
+
+     public struct EventPaymentIntentCanceled has copy, drop {
+       payment_intent_id: u32,
+       merchant_name: String
+    }
+    
+    public struct EventConditionalEscrowCreated has copy, drop{
+        escrow_id: u32,
+        buyer_name: String,
+        seller_name: String,
+        amount: u64,
+        condition_price: u64
+    }
+    
+    public struct EventConditionalEscrowFulfilled has copy, drop {
+        escrow_id: u32,
+        buyer_name: String,
+        seller_name: String
+    }
+    
+     public struct EventConditionalEscrowCanceled has copy, drop {
+       escrow_id: u32,
+        buyer_name: String
+    }
 
     fun init(ctx: &mut TxContext) {
         let accounts= vec_map::empty<String, User>();
@@ -133,23 +217,6 @@ module suipay::suipay {
         let sender = ctx.sender();
         transfer::share_object(sui_pay);
     } 
-
-    // public entry fun update_user_name(sui_pay: &mut SuiPay, old_name: String, new_name: String, ctx: &mut TxContext){
-    //     assert!(!user_exists(sui_pay, new_name), EUserAlreadyExists);
-    //     let mut user = get_user(sui_pay, old_name);
-    //     let old_name_copy = user.username.name;
-    //     user.username.name = new_name;
-    //     vec_map::remove(&mut sui_pay.accounts, &old_name);
-    //     vec_map::insert(&mut sui_pay.accounts, new_name, user);
-    //     event::emit(
-    //         EventUserNameUpdated {
-    //             old_name: old_name_copy,
-    //             new_name,
-    //             owner: ctx.sender()
-    //         }
-    //     );
-    // }
-
 
     public entry fun add_user(name: String, owner: address, sui_pay: &mut SuiPay, img_url: vector<u8>, ctx: &mut TxContext) {
         assert!(!user_exists(sui_pay, name), EUserAlreadyExists);
@@ -167,6 +234,10 @@ module suipay::suipay {
             request_ids: vector::empty<RequestID>(),
             history: vector::empty<SendReceive>(),
             img_url: url::new_unsafe_from_bytes(img_url),
+            payment_intents: vec_map::empty<u32, PaymentIntent>(),
+            payment_intent_ids:  vector::empty<PaymentIntentID>(),
+            conditional_escrows: vec_map::empty<u32, ConditionalEscrow>(),
+            conditional_escrow_ids: vector::empty<ConditionalEscrowID>()
         };
         vec_map::insert(&mut sui_pay.accounts, name, user);
         vec_map::insert(&mut sui_pay.owner_map, owner, true);
@@ -177,7 +248,271 @@ module suipay::suipay {
             }
         );
     }
+    
+    public entry fun create_conditional_escrow(
+        sui_pay: &mut SuiPay,
+        buyer_name: String,
+        seller_name: String,
+        amount: u64,
+        condition_price: u64,
+        metadata: vector<u8>,
+        expiry: u64,
+        rnd: &Random,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let mut generator = new_generator(rnd, ctx);
+        let escrow_id = generate_u32(&mut generator);
+        let timestamp = clock::timestamp_ms(clock);
+        let conditional_escrow = ConditionalEscrow {
+            escrow_id,
+            buyer_name,
+            seller_name,
+            amount,
+            condition_price,
+            status: 0, // pending
+            token: string::utf8(b"SUI"),
+            created_at: timestamp,
+            metadata,
+             expiry
+        };
+        let escrow_id_struct = ConditionalEscrowID {
+            escrow_id
+        };
+        let mut buyer = get_user(sui_pay, buyer_name);
+        vec_map::insert(&mut buyer.conditional_escrows, escrow_id, conditional_escrow);
+        buyer.conditional_escrow_ids.push_back(escrow_id_struct);
+        event::emit(
+            EventConditionalEscrowCreated {
+                escrow_id,
+                buyer_name,
+                seller_name,
+                amount,
+                 condition_price
+            }
+        )
+    }
+    
+    public entry fun fulfill_conditional_escrow(
+        sui_pay: &mut SuiPay,
+        buyer_name: String,
+        escrow_id: u32,
+        coin: &mut Coin<SUI>,
+        price: u64, // Current Price
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let (seller_name, amount, expiry, condition_price, buyer_address) = get_conditional_escrow_info(sui_pay, buyer_name, escrow_id, clock, price, ctx);
+        assert!(clock::timestamp_ms(clock) <= expiry, EConditionalEscrowExpired);
+        assert!(price >= condition_price, EInsufficientBalance);
+        let seller_address =  get_seller_address(sui_pay, seller_name);
+        handle_conditional_escrow_payment(sui_pay, seller_name, seller_address, amount, coin, buyer_address, ctx);
+        event::emit(EventConditionalEscrowFulfilled {
+            escrow_id,
+            buyer_name,
+            seller_name
+        });
+    }
+    fun get_seller_address(sui_pay: &mut SuiPay,seller_name: String) : address {
+        let mut seller = get_user(sui_pay, seller_name);
+        seller.username.owner
+    }
+    fun get_conditional_escrow_info(
+        sui_pay: &mut SuiPay,
+        buyer_name: String,
+        escrow_id: u32,
+        clock: &Clock,
+        price: u64,
+        ctx: &mut TxContext
+    ) : (String, u64, u64, u64, address) {
+        let mut buyer = get_user(sui_pay, buyer_name);
+        assert!(vec_map::contains(&buyer.conditional_escrows, &escrow_id), EConditionalEscrowNotFound);
+        let mut conditional_escrow = vec_map::get_mut(&mut buyer.conditional_escrows, &escrow_id);
+        assert!(conditional_escrow.status == 0, EConditionalEscrowAlreadyFulfilled);
+        let seller_name = conditional_escrow.seller_name;
+        let amount = conditional_escrow.amount;
+        let expiry = conditional_escrow.expiry;
+        let condition_price = conditional_escrow.condition_price;
+        let buyer_address = buyer.username.owner;
+        conditional_escrow.status = 1;
+        (seller_name, amount, expiry, condition_price, buyer_address)
+    }
+    
+      
+    fun handle_conditional_escrow_payment(
+        sui_pay: &mut SuiPay, 
+        seller_name: String, 
+        receiver_address: address, 
+        payment_amount: u64, 
+        coin: &mut Coin<SUI>,
+        sender_address: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(coin::value(coin) >= payment_amount, EInsufficientBalance);
+        pay::split_and_transfer(coin, payment_amount, receiver_address, ctx);
+        let mut seller = get_user(sui_pay, seller_name);
+        let receive_entry = SendReceive {
+            action: b"+", 
+            amount: payment_amount, 
+            message: vector::empty(), 
+            otherPartyAddress: sender_address, 
+            otherPartyName: b"Customer".to_string()
+        };
+        seller.history.push_back(receive_entry);
+    }
+    
+    public entry fun cancel_conditional_escrow(sui_pay: &mut SuiPay, buyer_name: String, escrow_id: u32) {
+        let mut buyer = get_user(sui_pay, buyer_name);
+        assert!(vec_map::contains(&buyer.conditional_escrows, &escrow_id), EConditionalEscrowNotFound);
+        let mut conditional_escrow = vec_map::get_mut(&mut buyer.conditional_escrows, &escrow_id);
+        assert!(conditional_escrow.status == 0, EConditionalEscrowAlreadyFulfilled);
+        conditional_escrow.status = 2; //cancel
+        let (found, index) = vector::index_of(&buyer.conditional_escrow_ids, &ConditionalEscrowID{escrow_id});
+          if(found){
+            vector::remove(&mut buyer.conditional_escrow_ids, index);
+            event::emit(
+                EventConditionalEscrowCanceled {
+                   escrow_id,
+                   buyer_name
+                }
+            )
+        }
+    }
+    
 
+    public entry fun create_payment_intent(
+        sui_pay: &mut SuiPay,
+        merchant_name: String,
+        amount: u64,
+        metadata: vector<u8>,
+        rnd: &Random,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let mut generator = new_generator(rnd, ctx);
+        let payment_intent_id = generate_u32(&mut generator);
+        let timestamp = clock::timestamp_ms(clock);
+        let sender = ctx.sender();
+        let payment_intent = PaymentIntent {
+           payment_intent_id,
+            merchant_name,
+            amount,
+            currency: string::utf8(b"SUI"),
+            customer_address: sender,
+            status: 0, // pending
+            timestamp,
+            metadata,
+        };
+        
+        let payment_intent_id_struct = PaymentIntentID {
+            payment_intent_id
+        };
+
+        let mut user = get_user(sui_pay, merchant_name);
+        vec_map::insert(&mut user.payment_intents, payment_intent_id, payment_intent);
+        user.payment_intent_ids.push_back(payment_intent_id_struct);
+        event::emit(EventPaymentIntentCreated {
+             payment_intent_id,
+            merchant_name,
+            amount,
+        });
+    }
+
+    public entry fun pay_with_payment_intent(
+        sui_pay: &mut SuiPay,
+        name: String,
+        payment_intent_id: u32,
+        coin: &mut Coin<SUI>,
+        ctx: &mut TxContext
+        ) {
+          let sender_address = ctx.sender();
+        let (merchant_name, payment_amount, receiver_address) = handle_user_payment_intent(sui_pay, name, payment_intent_id, sender_address);
+        handle_merchant_payment(sui_pay, merchant_name, receiver_address, payment_amount, coin, sender_address, ctx);
+        event::emit(EventPaymentIntentPaid {
+            payment_intent_id,
+            merchant_name,
+            amount: payment_amount
+        });
+    }
+
+    fun handle_user_payment_intent(
+        sui_pay: &mut SuiPay,
+        name: String,
+        payment_intent_id: u32,
+        sender_address: address
+     ) : (String, u64, address){
+        let mut user = get_user(sui_pay, name);
+        assert!(vec_map::contains(&user.payment_intents, &payment_intent_id), EPaymentIntentNotFound);
+        let mut payment_intent = vec_map::get_mut(&mut user.payment_intents, &payment_intent_id);
+        assert!(payment_intent.status == 0, EPaymentIntentAlreadyPaid); // Check if order is still pending
+        payment_intent.status = 1; // Update status to paid
+        let merchant_name = user.username.name;
+        let payment_amount = payment_intent.amount;
+        let receiver_address = user.username.owner;
+        (merchant_name, payment_amount, receiver_address)
+      }
+    
+    fun handle_merchant_payment(
+        sui_pay: &mut SuiPay, 
+        merchant_name: String, 
+        receiver_address: address, 
+        payment_amount: u64, 
+        coin: &mut Coin<SUI>,
+        sender_address: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(coin::value(coin) >= payment_amount, EInsufficientBalance);
+        pay::split_and_transfer(coin, payment_amount, receiver_address, ctx);
+        let mut user = get_user(sui_pay, merchant_name);
+        let receive_entry = SendReceive {
+            action: b"+", 
+            amount: payment_amount, 
+            message: vector::empty(), 
+            otherPartyAddress: sender_address, 
+            otherPartyName: b"Customer".to_string()
+        };
+        user.history.push_back(receive_entry);
+    }
+
+    public entry fun refund_with_payment_intent(sui_pay: &mut SuiPay, name: String, payment_intent_id: u32, ctx: &mut TxContext){
+        let mut user = get_user(sui_pay, name);
+        assert!(vec_map::contains(&user.payment_intents, &payment_intent_id), EPaymentIntentNotFound);
+        let mut payment_intent = vec_map::get_mut(&mut user.payment_intents, &payment_intent_id);
+        assert!(payment_intent.status == 1, EInvalidStatus);
+        payment_intent.status = 2; // Update status to refunded
+        let amount = payment_intent.amount;
+           let sender = ctx.sender();
+           let cash = coin::take(&mut user.balance, amount, ctx);
+        transfer::public_transfer(cash, sender);
+            event::emit(EventPaymentIntentRefunded {
+                 payment_intent_id,
+                merchant_name: name,
+                amount
+            });
+    }
+
+     public entry fun cancel_payment_intent(sui_pay: &mut SuiPay, name: String, payment_intent_id: u32) {
+        let mut user = get_user(sui_pay, name);
+        assert!(vec_map::contains(&user.payment_intents, &payment_intent_id), EPaymentIntentNotFound);
+        let mut payment_intent = vec_map::get_mut(&mut user.payment_intents, &payment_intent_id);
+        assert!(payment_intent.status == 0, EInvalidStatus);
+        payment_intent.status = 3;
+        let (found, index) = vector::index_of(&user.payment_intent_ids, &PaymentIntentID{payment_intent_id});
+        if(found){
+            vector::remove(&mut user.payment_intent_ids, index);
+            event::emit(
+                EventPaymentIntentCanceled {
+                    payment_intent_id,
+                    merchant_name: name
+                }
+            )
+        }
+
+    }
+
+    
+    
+    
     public entry fun deposit(sui_pay: &mut SuiPay, name: String, coin: &mut Coin<SUI>, amount: u64, ctx: &mut TxContext) {
         assert!(amount > 0, EInvalidDepositAmount);
         let sender = ctx.sender();
@@ -194,7 +529,7 @@ module suipay::suipay {
         );
     }
 
-     public entry fun create_request(sui_pay: &mut SuiPay, name: String, message: vector<u8>, amount: u64, requestor: String, rnd: &Random, ctx: &mut TxContext) {
+    public entry fun create_request(sui_pay: &mut SuiPay, name: String, message: vector<u8>, amount: u64, requestor: String, rnd: &Random, ctx: &mut TxContext) {
         let mut generator = new_generator(rnd, ctx);
         let id = generate_u32(&mut generator);
         let address_requestor = get_user_address(sui_pay, requestor);
@@ -222,7 +557,6 @@ module suipay::suipay {
             }
         )
     }
-
 
     public entry fun pay_request(
         sui_pay: &mut SuiPay, 
@@ -258,14 +592,13 @@ module suipay::suipay {
 
     }
 
-
     fun handle_user_request(
         sui_pay: &mut SuiPay, 
         name: String, 
         request_id: u32
     ): (String, address, u64, vector<u8>, String) {
         let mut user = get_user(sui_pay, name);
-       assert!(vec_map::contains(&user.requests, &request_id), ERequestNotFound);
+        assert!(vec_map::contains(&user.requests, &request_id), ERequestNotFound);
         let request = vec_map::get_mut(&mut user.requests, &request_id);
         let sender_name = user.username.name;
         let receiver = request.name_requestor;
@@ -281,15 +614,14 @@ module suipay::suipay {
         };
         user.history.push_back(sender_entry);
         vec_map::remove(&mut user.requests, &request_id);
-        let (found, index) = vector::index_of(&user.request_ids, &RequestID{ name, id: request_id});
+         let (found, index) = vector::index_of(&user.request_ids, &RequestID{ name, id: request_id});
             if(found){
-            vector::remove(&mut user.request_ids, index);
+                vector::remove(&mut user.request_ids, index);
             };
-
         (receiver, address_requestor, payment_amount, message, sender_name)
     }
-
-   fun handle_requestor_payment(
+    
+      fun handle_requestor_payment(
         sui_pay: &mut SuiPay, 
         receiver: String, 
         address_requestor: address, 
@@ -394,6 +726,53 @@ module suipay::suipay {
         filtered_history
     }
 
+    public fun get_all_payment_intent_by_merchant(name: String, sui_pay: &mut SuiPay, _ctx: &mut TxContext) : vector<PaymentIntentID>{
+        let mut user = get_user(sui_pay, name);
+        user.payment_intent_ids
+    }
+
+    
+    public fun get_payment_intent(name: String, sui_pay: &mut SuiPay, payment_intent_id: u32, _ctx: &mut TxContext): PaymentIntent{
+         let mut user = get_user(sui_pay, name);
+         assert!(vec_map::contains(&user.payment_intents, &payment_intent_id), EPaymentIntentNotFound);
+        *vec_map::get_mut(&mut user.payment_intents, &payment_intent_id)
+    }
+    public fun get_all_conditional_escrow_by_buyer(name: String, sui_pay: &mut SuiPay, _ctx: &mut TxContext): vector<ConditionalEscrowID>{
+         let mut user = get_user(sui_pay, name);
+         user.conditional_escrow_ids
+    }
+    public fun get_all_conditional_escrow_by_seller(name: String, sui_pay: &mut SuiPay, _ctx: &mut TxContext): vector<ConditionalEscrowID>{
+        let mut user = get_user(sui_pay, name);
+        let mut result = vector::empty<ConditionalEscrowID>();
+        let mut i = 0;
+        let len = vector::length(&user.conditional_escrow_ids);
+        while (i < len) {
+            let escrow_id_struct =  vector::borrow(&user.conditional_escrow_ids, i);
+            let conditional_escrow = vec_map::get_mut(&mut user.conditional_escrows, &escrow_id_struct.escrow_id);
+            if(&conditional_escrow.seller_name == &name){
+                vector::push_back(&mut result, *escrow_id_struct);
+            };
+            i = i + 1;
+        };
+        result
+    }
+
+    public fun get_conditional_escrow(name: String, sui_pay: &mut SuiPay, escrow_id: u32, _ctx: &mut TxContext): ConditionalEscrow {
+        let mut user = get_user(sui_pay, name);
+        assert!(vec_map::contains(&user.conditional_escrows, &escrow_id), EConditionalEscrowNotFound);
+        *vec_map::get_mut(&mut user.conditional_escrows, &escrow_id)
+    }
+    
+        public fun get_all_history(name: String, sui_pay: &mut SuiPay,ctx: &mut TxContext) : vector<SendReceive> {
+        let mut user = get_user(sui_pay, name);
+        user.history
+    }
+     
+    // public fun get_user_detail(name: String, sui_pay: &mut SuiPay, _ctx: &mut TxContext): &User{
+    //     let mut user = get_user(sui_pay, name);
+    //     *user
+    // }
+
     fun get_user(sui_pay: &mut SuiPay, name: String): &mut User {
         assert!(user_exists(sui_pay, name), EUserNotFound);
         vec_map::get_mut(&mut sui_pay.accounts, &name)
@@ -411,4 +790,6 @@ module suipay::suipay {
     fun user_owner_address(sui_pay: &mut SuiPay, owner: address): bool {
        vec_map::contains(&sui_pay.owner_map, &owner)
     }
+
+
 }
