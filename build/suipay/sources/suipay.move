@@ -435,7 +435,7 @@ module suipay::suipay {
         });
     }
 
-     fun handle_user_payment_intent(
+    fun handle_user_payment_intent(
         sui_pay: &mut SuiPay,
         name: String,
         payment_intent_id: u32,
@@ -529,7 +529,7 @@ module suipay::suipay {
         );
     }
 
-     public entry fun create_request(sui_pay: &mut SuiPay, name: String, message: vector<u8>, amount: u64, requestor: String, rnd: &Random, ctx: &mut TxContext) {
+    public entry fun create_request(sui_pay: &mut SuiPay, name: String, message: vector<u8>, amount: u64, requestor: String, rnd: &Random, ctx: &mut TxContext) {
         let mut generator = new_generator(rnd, ctx);
         let id = generate_u32(&mut generator);
         let address_requestor = get_user_address(sui_pay, requestor);
