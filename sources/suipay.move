@@ -24,7 +24,8 @@ module suipay::suipay {
     const ENotOwner: u64 = 8;
     const EInvalidUserOwner: u64 = 9;
     const EInvalidStatus: u64 = 12;
-
+    const EPaymentLinkNotFound: u64 = 13;
+    const EPaymentLinkAlreadyExists: u64 = 14;
     public struct Username has store {
         name: String,
         owner: address,
@@ -39,8 +40,15 @@ module suipay::suipay {
         request_ids: vector<RequestID>,
         history: vector<SendReceive>,
         img_url: Url,
+        payment_links: VecMap<u32, PaymentLink>,
     }
-    
+    public struct PaymentLink has store, drop, copy {
+        id: u32,
+        amount: u64,
+        message: String,
+        creator: address,
+        active: bool,
+    }
 
 
     public struct Request has store, drop, copy {
@@ -75,8 +83,24 @@ module suipay::suipay {
         name: String,
         owner: address,
     }
+    public struct EventPaymentLinkCreated has copy, drop {
+        link_id: u32,
+        creator: address,
+        amount: u64,
+        message: String,
+    }
 
-     public struct EventUserNameUpdated has copy, drop {
+    public struct EventPaymentLinkPaid has copy, drop {
+        link_id: u32,
+        payer: address,
+        amount: u64,
+    }
+
+    public struct EventPaymentLinkCanceled has copy, drop {
+        link_id: u32,
+        creator: address,
+    }
+    public struct EventUserNameUpdated has copy, drop {
         old_name: String,
         new_name: String,
         owner: address,
@@ -153,6 +177,7 @@ module suipay::suipay {
             request_ids: vector::empty<RequestID>(),
             history: vector::empty<SendReceive>(),
             img_url: url::new_unsafe_from_bytes(img_url),
+            payment_links: vec_map::empty<u32, PaymentLink>(),
         };
         vec_map::insert(&mut sui_pay.accounts, name, user);
         vec_map::insert(&mut sui_pay.owner_map, sender, true);
@@ -163,18 +188,92 @@ module suipay::suipay {
             }
         );
     }
-    public entry fun deposit(sui_pay: &mut SuiPay, name: String, coin: &mut Coin<SUI>, amount: u64, ctx: &mut TxContext) {
-        assert!(amount > 0, EInvalidDepositAmount);
+    public entry fun create_payment_link(
+        sui_pay: &mut SuiPay,
+        name: String,
+        amount: u64,
+        message: String,
+        rnd: &Random,
+        ctx: &mut TxContext
+    ) {
+        let mut user = get_user(sui_pay, name);
+        let sender = ctx.sender();
+        assert!(user.username.owner == sender, ENotOwner);
+        let mut generator = new_generator(rnd, ctx);
+        let link_id = generate_u32(&mut generator);
+        assert!(!vec_map::contains(&user.payment_links, &link_id), EPaymentLinkAlreadyExists);
+        let payment_link = PaymentLink {
+            id: link_id,
+            amount,
+            message,
+            creator: sender,
+            active: true,
+        };
+
+        vec_map::insert(&mut user.payment_links, link_id, payment_link);
+        event::emit(EventPaymentLinkCreated {
+            link_id,
+            creator: sender,
+            amount,
+            message,
+        });
+    }
+
+    public entry fun pay_via_payment_link(
+        sui_pay: &mut SuiPay,
+        name: String,
+        link_id: u32,
+        coin_input: Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let mut user = get_user(sui_pay, name);
+        let sender = ctx.sender();
+        assert!(vec_map::contains(&user.payment_links, &link_id), EPaymentLinkNotFound);
+        let payment_link = vec_map::get_mut(&mut user.payment_links, &link_id);
+        assert!(payment_link.active, EPaymentLinkNotFound);
+        let coin_amount = coin::value(&coin_input);
+        assert!(coin_amount == payment_link.amount, EInvalidDepositAmount);
+        balance::join(&mut user.balance, coin::into_balance(coin_input));
+        event::emit(EventPaymentLinkPaid {
+            link_id,
+            payer: sender,
+            amount: coin_amount,
+        });
+    }
+
+    public entry fun cancel_payment_link(
+        sui_pay: &mut SuiPay,
+        name: String,
+        link_id: u32,
+        ctx: &mut TxContext
+    ) {
+        let mut user = get_user(sui_pay, name);
+        let sender = ctx.sender();
+
+        assert!(vec_map::contains(&user.payment_links, &link_id), EPaymentLinkNotFound);
+        let payment_link = vec_map::get_mut(&mut user.payment_links, &link_id);
+        assert!(payment_link.active, EPaymentLinkNotFound);
+        assert!(payment_link.creator == sender, ENotOwner);
+
+        payment_link.active = false;
+        event::emit(EventPaymentLinkCanceled {
+            link_id,
+            creator: sender,
+        });
+    }
+
+
+
+    public entry fun deposit(sui_pay: &mut SuiPay, name: String, coin_input: Coin<SUI>, ctx: &mut TxContext) {
         let sender = ctx.sender();
         let mut user = get_user(sui_pay, name);
         assert!(user.username.owner == sender, ENotOwner);
-        assert!(coin::value(coin) >= amount, EInsufficientBalance);
-        let split_balance = balance_split(coin::balance_mut(coin), amount);
-        balance::join(&mut user.balance, split_balance);
+        let coin_amount = coin::value(&coin_input);
+        balance::join(&mut user.balance, coin::into_balance(coin_input));
         event::emit(
             EventDepositMade {
                 name,
-                amount
+                amount: coin_amount
             }
         );
     }
