@@ -87,11 +87,8 @@ Contributions are welcome! Please open an issue or submit a pull request for any
 
 ---
 
-## 📧 Contact
-
-For questions or support, please contact us at [your-email@example.com](mailto:your-email@example.com).
 
 ---
 
 **Empower your payments with Kaisho Pay and experience seamless Web3 transactions!**
-```
+
